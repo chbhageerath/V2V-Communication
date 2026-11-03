@@ -1,0 +1,680 @@
+#define BLYNK_TEMPLATE_ID   "TMPL3qNmBoJd9"
+#define BLYNK_TEMPLATE_NAME "V2V COMMUNICATION"
+#define BLYNK_AUTH_TOKEN    "1eFykpzuOiPqWlBD-otFsjbM6d0p_DTO"
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <BluetoothSerial.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <math.h>
+
+// ==================================================
+// 1. WIFI SETTINGS
+// ==================================================
+
+const char* ssid = "Bgr";
+const char* password = "11223344";
+
+// ==================================================
+// 2. BLUETOOTH
+// ==================================================
+
+BluetoothSerial SerialBT;
+
+const char* BT_NAME = "V2V_TRANSMITTER";
+
+// ==================================================
+// 3. HARDWARE PINS
+// ==================================================
+
+#define FIRE_PIN 33
+#define TRIG_PIN 26
+#define ECHO_PIN 25
+#define LED_PIN 5
+
+// ==================================================
+// 4. SENSOR THRESHOLDS
+// ==================================================
+
+const float OBSTACLE_DISTANCE_CM = 30.0;
+const float IMPACT_THRESHOLD = 2.5 * 9.80665;
+
+// ==================================================
+// 5. TIMING
+// ==================================================
+
+const unsigned long SENSOR_INTERVAL = 100;
+const unsigned long BT_SEND_INTERVAL = 500;
+const unsigned long BLYNK_UPDATE_INTERVAL = 1000;
+const unsigned long WIFI_RETRY_INTERVAL = 15000;
+const unsigned long WARNING_REPEAT_INTERVAL = 5000;
+
+// Li-Fi pulse timings: keep synchronized with receiver.
+
+const unsigned int PREAMBLE_MS = 300;
+const unsigned int BIT_ONE_MS = 180;
+const unsigned int BIT_ZERO_MS = 70;
+const unsigned int BIT_GAP_MS = 100;
+
+// ==================================================
+// 6. SENSOR OBJECT
+// ==================================================
+
+Adafruit_MPU6050 mpu;
+
+bool mpuAvailable = false;
+
+// ==================================================
+// 7. SENSOR DATA
+// ==================================================
+
+float acceleration = -1.0;
+float distanceCm = -1.0;
+
+int fireDetected = 0;
+int impactDetected = 0;
+int obstacleDetected = 0;
+int warningLED = 0;
+
+// ==================================================
+// 8. TIMERS AND FLAGS
+// ==================================================
+
+unsigned long lastSensorRead = 0;
+unsigned long lastBluetoothSend = 0;
+unsigned long lastBlynkUpdate = 0;
+unsigned long lastWiFiRetry = 0;
+unsigned long lastWarningTransmission = 0;
+
+unsigned long packetID = 0;
+
+bool wifiStarted = false;
+
+// ==================================================
+// 9. LIFI TRANSMISSION VARIABLES
+// ==================================================
+
+String lightMessage = "";
+
+bool lightSending = false;
+
+int charIndex = -1;
+int bitIndex = 7;
+int lightPhase = 0;
+
+unsigned long phaseStart = 0;
+unsigned int currentOnTime = 0;
+
+// ==================================================
+// 10. WIFI AND BLYNK CONNECTION
+// ==================================================
+
+void maintainWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (!wifiStarted) {
+
+    wifiStarted = true;
+    lastWiFiRetry = now;
+
+    Serial.println("Starting WiFi...");
+
+    WiFi.begin(ssid, password);
+
+    return;
+  }
+
+  if (now - lastWiFiRetry >= WIFI_RETRY_INTERVAL) {
+
+    lastWiFiRetry = now;
+
+    Serial.println("WiFi disconnected. Reconnecting...");
+
+    WiFi.reconnect();
+  }
+}
+
+void maintainBlynk() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (Blynk.connected()) {
+    return;
+  }
+
+  static unsigned long lastBlynkRetry = 0;
+
+  unsigned long now = millis();
+
+  if (now - lastBlynkRetry >= 5000) {
+
+    lastBlynkRetry = now;
+
+    Serial.println("Connecting to Blynk Cloud...");
+
+    Blynk.connect(1000);
+
+    if (Blynk.connected()) {
+      Serial.println("Blynk connected!");
+    } else {
+      Serial.println("Blynk connection pending.");
+    }
+  }
+}
+
+// ==================================================
+// 11. READ ULTRASONIC DISTANCE
+// ==================================================
+
+float readDistanceCM() {
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+
+  if (duration == 0) {
+    return -1.0;
+  }
+
+  return duration * 0.0343 / 2.0;
+}
+
+// ==================================================
+// 12. READ SENSORS
+// ==================================================
+
+void readSensors() {
+
+  // MPU6050 acceleration magnitude
+
+  if (mpuAvailable) {
+
+    sensors_event_t a, g, temp;
+
+    if (mpu.getEvent(&a, &g, &temp)) {
+
+      acceleration = sqrt(
+        a.acceleration.x * a.acceleration.x +
+        a.acceleration.y * a.acceleration.y +
+        a.acceleration.z * a.acceleration.z
+      );
+
+      impactDetected =
+        acceleration > IMPACT_THRESHOLD ? 1 : 0;
+
+    } else {
+
+      acceleration = -1.0;
+      impactDetected = 0;
+    }
+
+  } else {
+
+    acceleration = -1.0;
+    impactDetected = 0;
+  }
+
+  // Fire sensor assumes active LOW.
+
+  fireDetected =
+    digitalRead(FIRE_PIN) == LOW ? 1 : 0;
+
+  // Ultrasonic distance.
+
+  distanceCm = readDistanceCM();
+
+  obstacleDetected =
+    (distanceCm >= 0 &&
+     distanceCm < OBSTACLE_DISTANCE_CM) ? 1 : 0;
+
+  // Warning condition.
+
+  warningLED =
+    (fireDetected ||
+     impactDetected ||
+     obstacleDetected) ? 1 : 0;
+
+  // LED is used for Li-Fi transmission.
+
+  if (!lightSending) {
+    digitalWrite(LED_PIN, LOW);
+  }
+}
+
+// ==================================================
+// 13. BUILD SENSOR MESSAGE
+// ==================================================
+
+String buildMessage(unsigned long id) {
+
+  String msg = "DATA,";
+
+  msg += String(id);
+  msg += ",";
+
+  msg += String(acceleration, 2);
+  msg += ",";
+
+  msg += String(fireDetected);
+  msg += ",";
+
+  msg += String(distanceCm, 2);
+  msg += ",";
+
+  msg += String(impactDetected);
+  msg += ",";
+
+  msg += String(obstacleDetected);
+  msg += ",";
+
+  msg += String(warningLED);
+
+  return msg;
+}
+
+// ==================================================
+// 14. BUILD ALERT MESSAGE
+// ==================================================
+
+String getAlertMessage() {
+
+  if (fireDetected) {
+    return "FIRE DETECTED";
+  }
+
+  if (impactDetected) {
+    return "IMPACT WARNING";
+  }
+
+  if (obstacleDetected) {
+    return "OBSTACLE DETECTED";
+  }
+
+  return "NORMAL";
+}
+
+// ==================================================
+// 15. START LIFI TRANSMISSION
+// ==================================================
+
+void startLightTransmission(const String& message) {
+
+  lightMessage = message + "\n";
+
+  charIndex = -1;
+  bitIndex = 7;
+  lightPhase = 0;
+
+  phaseStart = millis();
+
+  lightSending = true;
+
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.print("LIFI TX START: ");
+  Serial.println(message);
+}
+
+// ==================================================
+// 16. TRANSMIT LIFI DATA
+// ==================================================
+
+void updateLightTransmission() {
+
+  if (!lightSending) {
+
+    digitalWrite(LED_PIN, LOW);
+
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (lightPhase == 0) {
+
+    digitalWrite(LED_PIN, HIGH);
+
+    if (charIndex == -1) {
+
+      currentOnTime = PREAMBLE_MS;
+
+    } else {
+
+      uint8_t value = (uint8_t)lightMessage[charIndex];
+
+      bool bitValue = (value >> bitIndex) & 0x01;
+
+      currentOnTime =
+        bitValue ? BIT_ONE_MS : BIT_ZERO_MS;
+    }
+
+    phaseStart = now;
+
+    lightPhase = 1;
+
+    return;
+  }
+
+  if (lightPhase == 1) {
+
+    if (now - phaseStart >= currentOnTime) {
+
+      digitalWrite(LED_PIN, LOW);
+
+      phaseStart = now;
+
+      lightPhase = 2;
+    }
+
+    return;
+  }
+
+  if (lightPhase == 2) {
+
+    if (now - phaseStart < BIT_GAP_MS) {
+      return;
+    }
+
+    if (charIndex == -1) {
+
+      charIndex = 0;
+      bitIndex = 7;
+      lightPhase = 0;
+
+      return;
+    }
+
+    bitIndex--;
+
+    if (bitIndex < 0) {
+
+      bitIndex = 7;
+      charIndex++;
+    }
+
+    if (charIndex >= (int)lightMessage.length()) {
+
+      lightSending = false;
+
+      digitalWrite(LED_PIN, LOW);
+
+      Serial.println("LIFI TX COMPLETE");
+
+      return;
+    }
+
+    lightPhase = 0;
+  }
+}
+
+// ==================================================
+// 17. SEND BLUETOOTH DATA
+// ==================================================
+
+void sendBluetoothData() {
+
+  if (!SerialBT.hasClient()) {
+    return;
+  }
+
+  packetID++;
+
+  String message = buildMessage(packetID);
+
+  SerialBT.println(message);
+
+  Serial.print("BLUETOOTH TX: ");
+  Serial.println(message);
+}
+
+// ==================================================
+// 18. SEND LIFI WARNING
+// ==================================================
+
+void sendLiFiWarning() {
+
+  if (!warningLED || lightSending) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastWarningTransmission <
+      WARNING_REPEAT_INTERVAL) {
+    return;
+  }
+
+  lastWarningTransmission = now;
+
+  packetID++;
+
+  String message = buildMessage(packetID);
+
+  startLightTransmission(message);
+}
+
+// ==================================================
+// 19. SEND SENSOR DATA TO BLYNK
+// ==================================================
+
+void uploadToBlynk() {
+
+  if (!Blynk.connected()) {
+    return;
+  }
+
+  // V0: Acceleration
+  // Skip invalid MPU6050 readings.
+
+  if (acceleration >= 0) {
+    Blynk.virtualWrite(V0, acceleration);
+  }
+
+  // V1: Fire detection (0 = normal, 1 = fire)
+
+  Blynk.virtualWrite(V1, fireDetected);
+
+  // V2: Ultrasonic distance
+  // Your current Blynk V2 datastream is Integer.
+  // Do not send invalid distance readings.
+
+  if (distanceCm >= 0) {
+    Blynk.virtualWrite(V2, (int)round(distanceCm));
+  }
+
+  // V3: Emergency alert text
+
+  String alertMessage = getAlertMessage();
+
+  Blynk.virtualWrite(V3, alertMessage);
+
+  Serial.println("Blynk data updated.");
+
+  Serial.print("Acceleration: ");
+  Serial.println(acceleration, 2);
+
+  Serial.print("Fire: ");
+  Serial.println(fireDetected);
+
+  Serial.print("Distance: ");
+  Serial.println(distanceCm, 2);
+
+  Serial.print("Alert: ");
+  Serial.println(alertMessage);
+}
+
+// ==================================================
+// 20. SETUP
+// ==================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(FIRE_PIN, INPUT_PULLUP);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  // Initialize I2C.
+
+  Wire.begin(21, 22);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("SECURE OPTICAL V2V TRANSMITTER");
+  Serial.println("BLYNK IOT ENABLED");
+  Serial.println("================================");
+
+  // Initialize MPU6050.
+
+  if (mpu.begin()) {
+
+    mpuAvailable = true;
+
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    Serial.println("MPU6050 detected.");
+
+  } else {
+
+    mpuAvailable = false;
+
+    Serial.println("WARNING: MPU6050 not detected.");
+  }
+
+  // Initialize Bluetooth.
+
+  if (SerialBT.begin(BT_NAME)) {
+
+    Serial.println("Bluetooth initialized.");
+    Serial.print("Device name: ");
+    Serial.println(BT_NAME);
+
+  } else {
+
+    Serial.println("Bluetooth initialization failed.");
+  }
+
+  // Initialize WiFi and Blynk.
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  WiFi.begin(ssid, password);
+
+  wifiStarted = true;
+  lastWiFiRetry = millis();
+
+  Serial.println("Connecting to WiFi...");
+
+  Serial.println("Transmitter ready.");
+}
+
+// ==================================================
+// 21. MAIN LOOP
+// ==================================================
+
+void loop() {
+
+  unsigned long now = millis();
+
+  // Keep WiFi connected.
+
+  maintainWiFi();
+
+  // Maintain Blynk connection.
+
+  maintainBlynk();
+
+  // Blynk background processing.
+
+  if (Blynk.connected()) {
+    Blynk.run();
+  }
+
+  // Continue Li-Fi transmission.
+
+  updateLightTransmission();
+
+  // Read sensors every 100 ms.
+
+  if (now - lastSensorRead >= SENSOR_INTERVAL) {
+
+    lastSensorRead = now;
+
+    readSensors();
+  }
+
+  // Bluetooth data every 500 ms.
+
+  if (now - lastBluetoothSend >= BT_SEND_INTERVAL) {
+
+    lastBluetoothSend = now;
+
+    sendBluetoothData();
+  }
+
+  // Transmit Li-Fi warnings.
+
+  sendLiFiWarning();
+
+  // Update Blynk every second.
+
+  if (now - lastBlynkUpdate >= BLYNK_UPDATE_INTERVAL) {
+
+    lastBlynkUpdate = now;
+
+    uploadToBlynk();
+  }
+
+  // Print sensor readings every second.
+
+  static unsigned long lastPrint = 0;
+
+  if (now - lastPrint >= 1000) {
+
+    lastPrint = now;
+
+    Serial.print("Acceleration: ");
+    Serial.print(acceleration, 2);
+
+    Serial.print(" | Fire: ");
+    Serial.print(fireDetected);
+
+    Serial.print(" | Distance: ");
+    Serial.print(distanceCm, 2);
+
+    Serial.print(" | Impact: ");
+    Serial.print(impactDetected);
+
+    Serial.print(" | Obstacle: ");
+    Serial.print(obstacleDetected);
+
+    Serial.print(" | Warning: ");
+    Serial.println(warningLED);
+  }
+}
+

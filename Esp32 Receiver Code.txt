@@ -1,0 +1,271 @@
+#include <Wire.h>
+#include <BluetoothSerial.h>
+#include <LiquidCrystal_I2C.h>
+#include <string.h>
+
+BluetoothSerial SerialBT;
+uint8_t transmitterMAC[6] = {0x20, 0x9B, 0xA9, 0x8F, 0xFF, 0x12};
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define LIGHT_SENSOR_PIN 34
+#define BUZZER_PIN 14
+#define LIGHT_ACTIVE_STATE HIGH  // Change to LOW if your sensor output is active LOW.
+
+const unsigned long PREAMBLE_MIN_MS = 240, PREAMBLE_MAX_MS = 380;
+const unsigned long BIT_ONE_MIN_MS = 140, BIT_ONE_MAX_MS = 230;
+const unsigned long BIT_ZERO_MIN_MS = 40, BIT_ZERO_MAX_MS = 110;
+const unsigned long PACKET_TIMEOUT_MS = 2500;
+const unsigned long BT_RETRY_INTERVAL_MS = 5000;
+
+float acceleration = -1.0, distanceCm = -1.0;
+int fireDetected = 0, impactDetected = 0, obstacleDetected = 0, warningStatus = 0;
+
+unsigned long lastPacketID = 0;
+bool havePacket = false;
+unsigned long lastValidDataAt = 0, lastBTAttempt = 0;
+String btBuffer = "";
+
+int previousLightState = LOW;
+unsigned long lightOnStart = 0, lastLightActivity = 0;
+bool receivingLight = false;
+String lightBuffer = "";
+int bitCount = 0;
+uint8_t currentByte = 0;
+
+char previousRow0[17] = "";
+char previousRow1[17] = "";
+
+// Print only if the LCD row actually changes, preventing flicker.
+void printLCDRowIfChanged(uint8_t row, const char *text, char *previous) {
+  char padded[17];
+  snprintf(padded, sizeof(padded), "%-16.16s", text);
+  if (strncmp(padded, previous, 16) != 0) {
+    lcd.setCursor(0, row);
+    lcd.print(padded);
+    strncpy(previous, padded, 16);
+    previous[16] = '\0';
+  }
+}
+
+bool isEmergency() {
+  return fireDetected || impactDetected || obstacleDetected || warningStatus;
+}
+
+const char *getWarningMessage() {
+  if (fireDetected) return "FIRE DETECTED!";
+  if (impactDetected) return "IMPACT DETECTED!";
+  if (obstacleDetected) return "OBSTACLE AHEAD!";
+  if (warningStatus) return "V2V WARNING!";
+  return "SYSTEM NORMAL";
+}
+
+// GPIO14 may drive a small buzzer module only.
+// Never connect a 12V buzzer directly to an ESP32 GPIO.
+void updateBuzzer() {
+  if (isEmergency()) tone(BUZZER_PIN, 2000);
+  else noTone(BUZZER_PIN);
+}
+
+void updateLCD() {
+  char row0[17], row1[17];
+
+  if (isEmergency()) {
+    snprintf(row0, sizeof(row0), "!!! WARNING !!!");
+    snprintf(row1, sizeof(row1), "%s", getWarningMessage());
+  } else {
+    if (distanceCm >= 0)
+      snprintf(row0, sizeof(row0), "D:%4.0fcm F:%d", distanceCm, fireDetected);
+    else
+      snprintf(row0, sizeof(row0), "D: --cm F:%d", fireDetected);
+
+    if (acceleration >= 0)
+      snprintf(row1, sizeof(row1), "I:%d O:%d A:%3.1f",
+               impactDetected, obstacleDetected, acceleration);
+    else
+      snprintf(row1, sizeof(row1), "I:%d O:%d A: --",
+               impactDetected, obstacleDetected);
+  }
+
+  printLCDRowIfChanged(0, row0, previousRow0);
+  printLCDRowIfChanged(1, row1, previousRow1);
+}
+
+void applyPacket(unsigned long id, float newAcceleration, int newFire,
+                 float newDistance, int newImpact, int newObstacle,
+                 int newWarningStatus) {
+  // Ignore duplicates arriving through Bluetooth and Li-Fi.
+  if (havePacket && id == lastPacketID) return;
+  if (havePacket && id < lastPacketID) return;
+
+  havePacket = true;
+  lastPacketID = id;
+  lastValidDataAt = millis();
+
+  acceleration = newAcceleration;
+  fireDetected = newFire;
+  distanceCm = newDistance;
+  impactDetected = newImpact;
+  obstacleDetected = newObstacle;
+  warningStatus = newWarningStatus;
+
+  updateLCD();
+  updateBuzzer();
+
+  Serial.print("Packet accepted: ");
+  Serial.println(lastPacketID);
+}
+
+// Format: DATA,id,acceleration,fire,distance,impact,obstacle,warning
+bool parseDataMessage(String msg) {
+  msg.trim();
+  if (!msg.startsWith("DATA,")) return false;
+
+  float values[7];
+  int start = 5;
+
+  for (int i = 0; i < 7; i++) {
+    int comma = msg.indexOf(',', start);
+    String part;
+
+    if (i < 6) {
+      if (comma < 0) return false;
+      part = msg.substring(start, comma);
+      start = comma + 1;
+    } else {
+      part = msg.substring(start);
+    }
+
+    part.trim();
+    if (part.length() == 0) return false;
+    values[i] = part.toFloat();
+  }
+
+  applyPacket((unsigned long)values[0], values[1], (int)values[2],
+              values[3], (int)values[4], (int)values[5], (int)values[6]);
+  return true;
+}
+
+void maintainBluetooth() {
+  if (SerialBT.connected()) return;
+  if (millis() - lastBTAttempt < BT_RETRY_INTERVAL_MS) return;
+
+  lastBTAttempt = millis();
+  Serial.println("Connecting to transmitter...");
+  if (SerialBT.connect(transmitterMAC)) Serial.println("Bluetooth connected.");
+  else Serial.println("Bluetooth connection failed; retrying.");
+}
+
+void processBluetooth() {
+  while (SerialBT.available()) {
+    char c = (char)SerialBT.read();
+    if (c == '\n') {
+      btBuffer.trim();
+      if (btBuffer.startsWith("DATA,")) parseDataMessage(btBuffer);
+      btBuffer = "";
+    } else if (c != '\r') {
+      if (btBuffer.length() < 150) btBuffer += c;
+      else btBuffer = "";
+    }
+  }
+}
+
+void resetLightDecoder() {
+  lightBuffer = "";
+  receivingLight = false;
+  bitCount = 0;
+  currentByte = 0;
+}
+
+void finishLightPacket() {
+  lightBuffer.trim();
+  if (lightBuffer.startsWith("DATA,")) parseDataMessage(lightBuffer);
+  resetLightDecoder();
+}
+
+void processLightSensor() {
+  int state = digitalRead(LIGHT_SENSOR_PIN);
+  unsigned long now = millis();
+
+  if (state == LIGHT_ACTIVE_STATE && previousLightState != LIGHT_ACTIVE_STATE) {
+    lightOnStart = now;
+    lastLightActivity = now;
+  }
+
+  if (state != LIGHT_ACTIVE_STATE && previousLightState == LIGHT_ACTIVE_STATE) {
+    unsigned long pulseLength = now - lightOnStart;
+    lastLightActivity = now;
+
+    if (pulseLength >= PREAMBLE_MIN_MS && pulseLength <= PREAMBLE_MAX_MS) {
+      receivingLight = true;
+      lightBuffer = "";
+      bitCount = 0;
+      currentByte = 0;
+    } else if (receivingLight) {
+      int bitValue = -1;
+      if (pulseLength >= BIT_ONE_MIN_MS && pulseLength <= BIT_ONE_MAX_MS)
+        bitValue = 1;
+      else if (pulseLength >= BIT_ZERO_MIN_MS && pulseLength <= BIT_ZERO_MAX_MS)
+        bitValue = 0;
+
+      if (bitValue >= 0) {
+        currentByte = (currentByte << 1) | bitValue;
+        bitCount++;
+
+        if (bitCount == 8) {
+          char receivedChar = (char)currentByte;
+          if (receivedChar == '\n') {
+            finishLightPacket();
+          } else if (lightBuffer.length() < 150) {
+            lightBuffer += receivedChar;
+          } else {
+            resetLightDecoder();
+          }
+          bitCount = 0;
+          currentByte = 0;
+        }
+      }
+    }
+  }
+
+  previousLightState = state;
+  if (receivingLight && now - lastLightActivity > PACKET_TIMEOUT_MS)
+    resetLightDecoder();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LIGHT_SENSOR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+
+  printLCDRowIfChanged(0, "V2V RECEIVER", previousRow0);
+  printLCDRowIfChanged(1, "Starting...", previousRow1);
+
+  SerialBT.begin("V2V_RECEIVER", true); // Bluetooth Classic client mode
+  SerialBT.setTimeout(50);
+  previousLightState = digitalRead(LIGHT_SENSOR_PIN);
+
+  Serial.println("Secure Optical V2V Receiver started.");
+  Serial.println("Waiting for Bluetooth / Li-Fi data...");
+  delay(800);
+
+  printLCDRowIfChanged(0, "Waiting for data", previousRow0);
+  printLCDRowIfChanged(1, "BT / Li-Fi", previousRow1);
+}
+
+void loop() {
+  processBluetooth();
+  processLightSensor();
+  maintainBluetooth();
+
+  if (!isEmergency() && lastValidDataAt != 0 &&
+      millis() - lastValidDataAt > 5000) {
+    printLCDRowIfChanged(0, "NO NEW DATA", previousRow0);
+    printLCDRowIfChanged(1, "Check transmitter", previousRow1);
+  }
+}
